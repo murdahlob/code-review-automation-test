@@ -58,8 +58,6 @@ jobs:
     name: SAST - Semgrep
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    container:
-      image: semgrep/semgrep
     steps:
       - name: Checkout this repository (self mode)
         if: env.TARGET_REPO == ''
@@ -72,6 +70,14 @@ jobs:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ env.TARGET_REF }}
 
+      # Semgrep runs as a `docker run` step rather than as a `container:` job.
+      # The semgrep/semgrep image is Alpine/musl and ships no glibc loader, so
+      # the glibc-linked Node that Actions injects into container jobs (to run
+      # JavaScript actions such as checkout / upload-artifact / upload-sarif)
+      # cannot be relied on to execute inside it. Keeping the scanner in a
+      # plain step leaves those actions on the host runner, and matches how the
+      # DAST workflow invokes its tools.
+      #
       # Rule packs: generic security packs + the stack confirmed by recon
       # (Next.js 15 / React 19 / TypeScript app -> react, typescript,
       # javascript, nodejs). `p/nextjs` resolves in the registry but is
@@ -79,17 +85,20 @@ jobs:
       - name: Semgrep scan
         continue-on-error: true
         run: |
-          semgrep scan \
-            --config p/default \
-            --config p/security-audit \
-            --config p/secrets \
-            --config p/owasp-top-ten \
-            --config p/javascript \
-            --config p/typescript \
-            --config p/react \
-            --config p/nodejs \
-            --metrics off \
-            --sarif --output semgrep.sarif
+          docker run --rm --user 0 \
+            -v "${PWD}:/src" -w /src \
+            semgrep/semgrep \
+            semgrep scan \
+              --config p/default \
+              --config p/security-audit \
+              --config p/secrets \
+              --config p/owasp-top-ten \
+              --config p/javascript \
+              --config p/typescript \
+              --config p/react \
+              --config p/nodejs \
+              --metrics off \
+              --sarif --output /src/semgrep.sarif
 
       - name: Upload Semgrep SARIF to Security tab
         if: always() && env.TARGET_REPO == ''
