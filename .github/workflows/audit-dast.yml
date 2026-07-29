@@ -218,7 +218,7 @@ jobs:
         run: |
           docker run --rm --network host \
             -v "${PWD}/${REPORT_DIR}:/output:rw" \
-            sullo/nikto:latest \
+            ghcr.io/sullo/nikto:latest \
               -h "$TARGET_URL" \
               -maxtime 15m \
               -Format htm \
@@ -230,7 +230,7 @@ jobs:
         run: |
           docker run --rm --network host \
             -v "${PWD}/${REPORT_DIR}:/output:rw" \
-            sullo/nikto:latest \
+            ghcr.io/sullo/nikto:latest \
               -h "$TARGET_URL" \
               -maxtime 15m \
               -Format json \
@@ -247,6 +247,28 @@ jobs:
         if: always()
         run: cp "$GITHUB_WORKSPACE/app.log" "$REPORT_DIR/app.log" || true
 
+      # Every scan step is `continue-on-error`, so one tool dying cannot abort the
+      # run. That also means a tool can fail completely while the step still
+      # reports success (e.g. an image that does not exist). This step turns
+      # "enabled but produced nothing" into a visible warning.
+      - name: Verify each enabled tool produced a report
+        if: always()
+        run: |
+          missing=0
+          check() {   # $1 = human name, $2 = enabled?, $3 = expected file
+            [ "$2" != "true" ] && return 0
+            if [ ! -s "$REPORT_DIR/$3" ]; then
+              echo "::warning::$1 was enabled but produced no $3 - check its step log"
+              missing=$((missing+1))
+            fi
+          }
+          check "ZAP baseline" "${{ inputs.run_zap_baseline }}" zap-baseline.json
+          check "ZAP full scan" "${{ inputs.run_zap_full }}"     zap-full.json
+          check "Nuclei"        "${{ inputs.run_nuclei }}"       nuclei.jsonl
+          check "Nikto (HTML)"  "${{ inputs.run_nikto }}"        nikto.html
+          check "Nikto (JSON)"  "${{ inputs.run_nikto }}"        nikto.json
+          echo "TOOLS_MISSING_REPORTS=$missing" >> "$GITHUB_ENV"
+
       - name: Report summary
         if: always()
         run: |
@@ -262,6 +284,10 @@ jobs:
             for f in "$REPORT_DIR"/*; do
               echo "| $(basename "$f") | $(stat -c%s "$f") bytes |"
             done
+            if [ "${TOOLS_MISSING_REPORTS:-0}" != "0" ]; then
+              echo ""
+              echo "**${TOOLS_MISSING_REPORTS} enabled tool(s) produced no report** - see warnings above."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload DAST reports
