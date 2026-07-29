@@ -1,0 +1,234 @@
+name: Code Audit (DAST)
+
+# Boots the application INSIDE the ephemeral runner and attacks that in-runner
+# instance with OWASP ZAP (baseline, then full active scan), Nuclei and Nikto.
+#
+# SAFETY
+#   * `workflow_dispatch` only — never on push/PR. Active scans send attack
+#     payloads and must never be triggered incidentally.
+#   * The only target is http://127.0.0.1:3000 inside this runner. The target
+#     URL is not an input, precisely so the workflow cannot be pointed at
+#     production, shared, or third-party infrastructure.
+#   * The app is booted with DUMMY Supabase credentials (see below). The real
+#     backend is a hosted Supabase project — a third party — so it must never
+#     receive scan traffic. With dummy values the app still serves every page;
+#     only the data/auth calls fail, which is acceptable for an unauthenticated
+#     DAST pass.
+#   * Nuclei runs with `-ni` (interactsh disabled) so no OAST callbacks leave
+#     the runner.
+#
+# The app under test (recon-confirmed): Next.js 15.2.4 / React 19 / TypeScript,
+# pnpm lockfile v9, no Dockerfile or compose file upstream -> the Node runtime
+# is set up directly on the runner rather than via a container image.
+#
+# Reports (HTML / JSON / JSONL / SARIF / XML, whatever each tool emits) are
+# uploaded as run artifacts only. They are NOT sent to the Security tab: these
+# are runtime URL findings, not source-file findings, so they would not map to
+# paths in this repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_zap_baseline:
+        description: "Run ZAP baseline (passive) scan"
+        required: false
+        default: true
+        type: boolean
+      run_zap_full:
+        description: "Run ZAP full ACTIVE scan (slow, sends attack payloads)"
+        required: false
+        default: true
+        type: boolean
+      run_nuclei:
+        description: "Run Nuclei"
+        required: false
+        default: true
+        type: boolean
+      run_nikto:
+        description: "Run Nikto"
+        required: false
+        default: true
+        type: boolean
+      zap_spider_minutes:
+        description: "Minutes ZAP may spend spidering (per scan)"
+        required: false
+        default: "5"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-dast-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_PORT: "3000"
+  TARGET_URL: "http://127.0.0.1:3000"
+  REPORT_DIR: dast-reports
+  # Dummy, non-routable Supabase config: lets the app build and boot without
+  # touching the real hosted project. Not secrets.
+  NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321"
+  NEXT_PUBLIC_SUPABASE_ANON_KEY: "dast-dummy-anon-key"
+  NEXT_PUBLIC_SITE_URL: "http://127.0.0.1:3000"
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  dast:
+    name: DAST - ZAP / Nuclei / Nikto
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Enable pnpm (lockfile is pnpm v9)
+        run: |
+          corepack enable
+          corepack prepare pnpm@9 --activate
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build application
+        run: pnpm build
+
+      - name: Prepare report directory
+        run: |
+          mkdir -p "$REPORT_DIR"
+          # ZAP's container user is not root; make the bind mount writable.
+          chmod 777 "$REPORT_DIR"
+
+      - name: Start application
+        run: |
+          nohup pnpm exec next start -H 0.0.0.0 -p "$APP_PORT" > app.log 2>&1 &
+          echo "APP_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for the application to respond
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS -o /dev/null "$TARGET_URL"; then
+              echo "App is up after ${i}s"
+              curl -sS -D - -o /dev/null "$TARGET_URL"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::App did not respond on $TARGET_URL within 60s"
+          cat app.log
+          exit 1
+
+      # ------------------------------------------------------------- ZAP
+      - name: ZAP baseline scan (passive)
+        if: inputs.run_zap_baseline
+        continue-on-error: true          # non-zero exit just means "alerts found"
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t "$TARGET_URL" \
+              -m "${{ inputs.zap_spider_minutes }}" \
+              -r zap-baseline.html \
+              -J zap-baseline.json \
+              -x zap-baseline.xml \
+              -w zap-baseline.md \
+              -I
+
+      - name: ZAP full scan (ACTIVE - sends attack payloads)
+        if: inputs.run_zap_full
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+              -t "$TARGET_URL" \
+              -m "${{ inputs.zap_spider_minutes }}" \
+              -r zap-full.html \
+              -J zap-full.json \
+              -x zap-full.xml \
+              -w zap-full.md \
+              -I
+
+      # ---------------------------------------------------------- Nuclei
+      - name: Nuclei scan
+        if: inputs.run_nuclei
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/reports:rw" \
+            projectdiscovery/nuclei:latest \
+              -target "$TARGET_URL" \
+              -ni \
+              -no-color \
+              -stats \
+              -jsonl-export /reports/nuclei.jsonl \
+              -sarif-export /reports/nuclei.sarif \
+              -output /reports/nuclei.txt
+
+      # ----------------------------------------------------------- Nikto
+      - name: Nikto scan (HTML report)
+        if: inputs.run_nikto
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/output:rw" \
+            sullo/nikto:latest \
+              -h "$TARGET_URL" \
+              -maxtime 15m \
+              -Format htm \
+              -o /output/nikto.html
+
+      - name: Nikto scan (JSON report)
+        if: inputs.run_nikto
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${PWD}/${REPORT_DIR}:/output:rw" \
+            sullo/nikto:latest \
+              -h "$TARGET_URL" \
+              -maxtime 15m \
+              -Format json \
+              -o /output/nikto.json
+
+      # --------------------------------------------------------- wrap-up
+      - name: Stop application
+        if: always()
+        run: |
+          if [ -n "${APP_PID:-}" ]; then kill "$APP_PID" 2>/dev/null || true; fi
+          pkill -f "next start" 2>/dev/null || true
+
+      - name: Collect application log
+        if: always()
+        run: cp app.log "$REPORT_DIR/app.log" || true
+
+      - name: Report summary
+        if: always()
+        run: |
+          {
+            echo "## DAST run summary"
+            echo ""
+            echo "Target (in-runner only): \`${TARGET_URL}\`"
+            echo ""
+            echo "| report | size |"
+            echo "|---|---|"
+            shopt -s nullglob
+            for f in "$REPORT_DIR"/*; do
+              echo "| $(basename "$f") | $(stat -c%s "$f") bytes |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload DAST reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: ${{ env.REPORT_DIR }}/
+          if-no-files-found: warn
