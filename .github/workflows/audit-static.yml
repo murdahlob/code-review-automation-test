@@ -3,45 +3,52 @@ name: Code Audit (static + SCA)
 # Non-interactive scanners: SAST (Semgrep, optional Snyk Code) + SCA/secrets
 # (OSV-Scanner, Trivy).
 #
+# This repository hosts NO application source of its own. The scan target is
+# cloned at workflow runtime from `target_repo` @ `target_ref` and the results
+# are published as run artifacts. See docs/adr/ADR-001.
+#
 # Two modes:
-#   * SELF scan (push / pull_request / dispatch with an empty `target_repo`):
-#     scans this repository's own tree. SARIF goes to Security -> Code scanning
-#     AND to run artifacts.
-#   * PARAMETERIZED scan (dispatch with `target_repo` set): checks out that
-#     repository instead. SARIF is uploaded as run artifacts ONLY — the Security
-#     tab is skipped because the file paths in the SARIF do not exist in this
-#     repository and would be dropped or mis-mapped.
+#   * TARGET scan (the default): `target_repo` is set, so that repository is
+#     checked out and scanned. SARIF is uploaded as run ARTIFACTS ONLY — the
+#     Security tab is skipped, because the file paths in the SARIF do not exist
+#     in this repository and would be dropped or mis-mapped.
+#   * SELF scan (clear `target_repo` to an empty string): scans this
+#     repository's own tree and additionally uploads SARIF to
+#     Security -> Code scanning. Nothing here is worth scanning today; the path
+#     is retained for a future target whose licence permits hosting its code in
+#     this repository.
+#
+# There is deliberately no push / pull_request trigger: this repo contains only
+# workflows and Markdown, so an automatic scan of its own tree would be pure
+# noise.
 #
 # DAST lives in audit-dast.yml (needs a running app). The AI reviewers
 # (CodeRabbit / DeepSource / PR-Agent) are driven from PRs, not from here.
 
 on:
-  push:
-    branches: [ main, master, "audit/**" ]
-  pull_request:
   workflow_dispatch:
     inputs:
       target_repo:
-        description: "owner/repo to scan instead of this repository (empty = scan this repo, with Security-tab upload)"
+        description: "owner/repo to clone and scan (clear to scan THIS repo instead, with Security-tab upload)"
         required: false
-        default: ""
+        default: "ILoveBacteria/english-vocab-memorization"
         type: string
       target_ref:
-        description: "branch/tag/SHA of target_repo (empty = its default branch). Ignored when target_repo is empty."
+        description: "branch/tag/SHA of target_repo. Pinned by default for reproducibility. Ignored when target_repo is empty."
         required: false
-        default: ""
+        default: "ed3b2bdfa8918e317a46b15766d5d0a3d30e88c9"
         type: string
 
 permissions:
   contents: read
-  security-events: write      # required to upload SARIF to the Security tab
+  security-events: write      # only used by the SELF-scan (Security tab) path
 
 concurrency:
   group: audit-static-${{ github.ref }}-${{ github.event.inputs.target_repo || 'self' }}
   cancel-in-progress: false
 
 env:
-  # Empty on push/pull_request, and on a dispatch that left the input blank.
+  # Empty only when the dispatcher explicitly cleared the input (SELF mode).
   TARGET_REPO: ${{ github.event.inputs.target_repo || '' }}
   TARGET_REF: ${{ github.event.inputs.target_ref || '' }}
 
@@ -54,7 +61,7 @@ jobs:
     container:
       image: semgrep/semgrep
     steps:
-      - name: Checkout this repository
+      - name: Checkout this repository (self mode)
         if: env.TARGET_REPO == ''
         uses: actions/checkout@v4
 
@@ -105,7 +112,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout this repository
+      - name: Checkout this repository (self mode)
         if: env.TARGET_REPO == ''
         uses: actions/checkout@v4
 
@@ -148,7 +155,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout this repository
+      - name: Checkout this repository (self mode)
         if: env.TARGET_REPO == ''
         uses: actions/checkout@v4
 
@@ -192,7 +199,7 @@ jobs:
   #   runs-on: ubuntu-latest
   #   timeout-minutes: 30
   #   steps:
-  #     - name: Checkout this repository
+  #     - name: Checkout this repository (self mode)
   #       if: env.TARGET_REPO == ''
   #       uses: actions/checkout@v4
   #     - name: Checkout target repository
@@ -241,7 +248,8 @@ jobs:
           {
             echo "## Static audit summary"
             echo ""
-            echo "Scanned: \`${TARGET_REPO:-${GITHUB_REPOSITORY}}\`"
+            echo "Scanned repo: \`${TARGET_REPO:-${GITHUB_REPOSITORY}}\`"
+            echo "Scanned ref:  \`${TARGET_REF:-default branch}\`"
             echo ""
             echo "| SARIF file | results |"
             echo "|---|---|"

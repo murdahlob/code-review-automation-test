@@ -1,14 +1,20 @@
 name: Code Audit (DAST)
 
-# Boots the application INSIDE the ephemeral runner and attacks that in-runner
-# instance with OWASP ZAP (baseline, then full active scan), Nuclei and Nikto.
+# Clones the target application at workflow runtime, boots it INSIDE the
+# ephemeral runner, and attacks that in-runner instance with OWASP ZAP
+# (baseline, then full active scan), Nuclei and Nikto.
+#
+# This repository hosts NO application source of its own — the app under test is
+# fetched from `target_repo` @ `target_ref` into ./target at run time and is
+# never committed here. See docs/adr/ADR-001.
 #
 # SAFETY
 #   * `workflow_dispatch` only — never on push/PR. Active scans send attack
 #     payloads and must never be triggered incidentally.
-#   * The only target is http://127.0.0.1:3000 inside this runner. The target
-#     URL is not an input, precisely so the workflow cannot be pointed at
-#     production, shared, or third-party infrastructure.
+#   * The only scan target is http://127.0.0.1:3000 inside this runner. The
+#     scanned URL is NOT an input, precisely so the workflow cannot be pointed
+#     at production, shared, or third-party infrastructure. `target_repo`
+#     selects which SOURCE is built — it can never redirect attack traffic.
 #   * The app is booted with DUMMY Supabase credentials (see below). The real
 #     backend is a hosted Supabase project — a third party — so it must never
 #     receive scan traffic. With dummy values the app still serves every page;
@@ -23,12 +29,22 @@ name: Code Audit (DAST)
 #
 # Reports (HTML / JSON / JSONL / SARIF / XML, whatever each tool emits) are
 # uploaded as run artifacts only. They are NOT sent to the Security tab: these
-# are runtime URL findings, not source-file findings, so they would not map to
-# paths in this repository.
+# are runtime URL findings against a repository whose source does not live
+# here, so they would not map to any path in this repository.
 
 on:
   workflow_dispatch:
     inputs:
+      target_repo:
+        description: "owner/repo of the application to clone, build and scan"
+        required: true
+        default: "ILoveBacteria/english-vocab-memorization"
+        type: string
+      target_ref:
+        description: "branch/tag/SHA of target_repo. Pinned by default for reproducibility."
+        required: false
+        default: "ed3b2bdfa8918e317a46b15766d5d0a3d30e88c9"
+        type: string
       run_zap_baseline:
         description: "Run ZAP baseline (passive) scan"
         required: false
@@ -59,13 +75,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: audit-dast-${{ github.ref }}
+  group: audit-dast-${{ github.ref }}-${{ github.event.inputs.target_repo }}
   cancel-in-progress: false
 
 env:
   APP_PORT: "3000"
   TARGET_URL: "http://127.0.0.1:3000"
   REPORT_DIR: dast-reports
+  APP_DIR: target
+  TARGET_REPO: ${{ github.event.inputs.target_repo }}
+  TARGET_REF: ${{ github.event.inputs.target_ref }}
   # Dummy, non-routable Supabase config: lets the app build and boot without
   # touching the real hosted project. Not secrets.
   NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321"
@@ -80,7 +99,22 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Validate target input
+        run: |
+          if [ -z "${TARGET_REPO}" ]; then
+            echo "::error::target_repo is required - this repository contains no application to boot."
+            exit 1
+          fi
+          echo "Will build and scan ${TARGET_REPO}@${TARGET_REF:-default branch}"
+
+      # Only the target is checked out; nothing from this repository is needed
+      # at run time.
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.TARGET_REF }}
+          path: ${{ env.APP_DIR }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -94,9 +128,11 @@ jobs:
           pnpm --version
 
       - name: Install dependencies
+        working-directory: ${{ env.APP_DIR }}
         run: pnpm install --frozen-lockfile
 
       - name: Build application
+        working-directory: ${{ env.APP_DIR }}
         run: pnpm build
 
       - name: Prepare report directory
@@ -106,8 +142,10 @@ jobs:
           chmod 777 "$REPORT_DIR"
 
       - name: Start application
+        working-directory: ${{ env.APP_DIR }}
         run: |
-          nohup pnpm exec next start -H 0.0.0.0 -p "$APP_PORT" > app.log 2>&1 &
+          nohup pnpm exec next start -H 0.0.0.0 -p "$APP_PORT" \
+            > "$GITHUB_WORKSPACE/app.log" 2>&1 &
           echo "APP_PID=$!" >> "$GITHUB_ENV"
 
       - name: Wait for the application to respond
@@ -121,7 +159,7 @@ jobs:
             sleep 1
           done
           echo "::error::App did not respond on $TARGET_URL within 60s"
-          cat app.log
+          cat "$GITHUB_WORKSPACE/app.log" || true
           exit 1
 
       # ------------------------------------------------------------- ZAP
@@ -207,7 +245,7 @@ jobs:
 
       - name: Collect application log
         if: always()
-        run: cp app.log "$REPORT_DIR/app.log" || true
+        run: cp "$GITHUB_WORKSPACE/app.log" "$REPORT_DIR/app.log" || true
 
       - name: Report summary
         if: always()
@@ -215,7 +253,8 @@ jobs:
           {
             echo "## DAST run summary"
             echo ""
-            echo "Target (in-runner only): \`${TARGET_URL}\`"
+            echo "Built from:  \`${TARGET_REPO}@${TARGET_REF:-default branch}\`"
+            echo "Scanned URL (in-runner only): \`${TARGET_URL}\`"
             echo ""
             echo "| report | size |"
             echo "|---|---|"
