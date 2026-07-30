@@ -71,8 +71,14 @@ on:
         default: "5"
         type: string
 
-permissions:
-  contents: read
+# TODO phase 2: pin every `uses:` below to a full commit SHA instead of a tag —
+# a repo evaluating supply-chain tooling should practice supply-chain hygiene.
+#
+# Least privilege: this workflow only clones a PUBLIC target (no token scopes
+# needed; the checkout also sets `persist-credentials: false`) and uploads run
+# artifacts, which use the Actions runtime token rather than GITHUB_TOKEN
+# scopes — so the token gets no permissions at all.
+permissions: {}
 
 concurrency:
   group: audit-dast-${{ github.ref }}-${{ github.event.inputs.target_repo }}
@@ -115,6 +121,10 @@ jobs:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ env.TARGET_REF }}
           path: ${{ env.APP_DIR }}
+          # Never write the job token into the UNTRUSTED target's .git/config —
+          # `pnpm install` / `pnpm build` below execute lifecycle and build
+          # scripts from that tree and its ~310 third-party packages.
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -246,6 +256,45 @@ jobs:
       - name: Collect application log
         if: always()
         run: cp "$GITHUB_WORKSPACE/app.log" "$REPORT_DIR/app.log" || true
+
+      # Reproducibility: record exactly which target commit, runtime and
+      # scanner builds this run used. Image digests identify the precise bits
+      # behind the floating `stable`/`latest` tags.
+      - name: Write run manifest
+        if: always()
+        run: |
+          {
+            echo "# DAST run manifest"
+            echo "workflow run: ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+            echo "date (UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "target input: ${TARGET_REPO}@${TARGET_REF:-default branch}"
+            echo "target HEAD:  $(git -C "$APP_DIR" rev-parse HEAD 2>/dev/null || echo 'n/a')"
+            echo "node:         $(node --version 2>/dev/null || echo 'n/a')"
+            echo "pnpm:         $(pnpm --version 2>/dev/null || echo 'n/a')"
+            echo ""
+            echo "## scanner images (digest = the exact bits that ran)"
+            for img in ghcr.io/zaproxy/zaproxy:stable projectdiscovery/nuclei:latest ghcr.io/sullo/nikto:latest; do
+              digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$img" 2>/dev/null \
+                || echo 'not pulled (tool disabled this run)')
+              echo "$img -> $digest"
+            done
+            echo ""
+            echo "## nuclei version"
+            if docker image inspect projectdiscovery/nuclei:latest >/dev/null 2>&1; then
+              docker run --rm projectdiscovery/nuclei:latest -version 2>&1 || true
+            else
+              echo "n/a (nuclei disabled this run)"
+            fi
+          } > run-manifest.txt
+          cat run-manifest.txt
+
+      - name: Upload run manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest
+          path: run-manifest.txt
+          if-no-files-found: warn
 
       # Every scan step is `continue-on-error`, so one tool dying cannot abort the
       # run. That also means a tool can fail completely while the step still

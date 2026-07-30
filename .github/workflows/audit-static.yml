@@ -1,7 +1,7 @@
 name: Code Audit (static + SCA)
 
-# Non-interactive scanners: SAST (Semgrep, optional Snyk Code) + SCA/secrets
-# (OSV-Scanner, Trivy).
+# Non-interactive scanners: SAST (Semgrep, CodeQL, optional Snyk Code) +
+# SCA/secrets (OSV-Scanner, Trivy).
 #
 # This repository hosts NO application source of its own. The scan target is
 # cloned at workflow runtime from `target_repo` @ `target_ref` and the results
@@ -39,9 +39,17 @@ on:
         default: "ed3b2bdfa8918e317a46b15766d5d0a3d30e88c9"
         type: string
 
+# TODO phase 2: pin every `uses:` below to a full commit SHA instead of a tag —
+# a repo evaluating supply-chain tooling should practice supply-chain hygiene.
+#
+# Least privilege: phase 1 publishes results as run artifacts only, so every
+# job needs at most `contents: read` (to check out code); artifact up/download
+# uses the Actions runtime token, not GITHUB_TOKEN scopes. `security-events:
+# write` was removed — only the dormant SELF-scan Security-tab upload steps
+# need it, and phase 2 (licensed target hosted in this repo) must re-add it on
+# the jobs that run codeql-action/upload-sarif before using SELF mode.
 permissions:
   contents: read
-  security-events: write      # only used by the SELF-scan (Security tab) path
 
 concurrency:
   group: audit-static-${{ github.ref }}-${{ github.event.inputs.target_repo || 'self' }}
@@ -58,6 +66,8 @@ jobs:
     name: SAST - Semgrep
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - name: Checkout this repository (self mode)
         if: env.TARGET_REPO == ''
@@ -69,6 +79,9 @@ jobs:
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ env.TARGET_REF }}
+          # Never write the job token into the UNTRUSTED target's .git/config —
+          # scanner steps operate on that tree.
+          persist-credentials: false
 
       # Semgrep runs as a `docker run` step rather than as a `container:` job.
       # The semgrep/semgrep image is Alpine/musl and ships no glibc loader, so
@@ -100,6 +113,25 @@ jobs:
               --metrics off \
               --sarif --output /src/semgrep.sarif
 
+      # Reproducibility fragment; the summary job assembles run-manifest.txt.
+      - name: Record run-manifest fragment (Semgrep)
+        if: always()
+        run: |
+          {
+            echo "## semgrep"
+            echo "image:   $(docker image inspect --format '{{index .RepoDigests 0}}' semgrep/semgrep 2>/dev/null || echo 'not pulled')"
+            echo "version: $(docker run --rm semgrep/semgrep semgrep --version 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-semgrep.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-semgrep
+          path: manifest-semgrep.txt
+          if-no-files-found: warn
+
       - name: Upload Semgrep SARIF to Security tab
         if: always() && env.TARGET_REPO == ''
         uses: github/codeql-action/upload-sarif@v3
@@ -120,6 +152,8 @@ jobs:
     name: SCA - OSV-Scanner
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
       - name: Checkout this repository (self mode)
         if: env.TARGET_REPO == ''
@@ -131,6 +165,9 @@ jobs:
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ env.TARGET_REF }}
+          # Never write the job token into the UNTRUSTED target's .git/config —
+          # scanner steps operate on that tree.
+          persist-credentials: false
 
       # Pinned to an exact release: the action has no floating `v1`/`v2` ref,
       # and its input was renamed `args` -> `scan-args` in v2. One arg per line.
@@ -143,6 +180,26 @@ jobs:
             --format=sarif
             --output=osv.sarif
             ./
+
+      # Reproducibility fragment; the summary job assembles run-manifest.txt.
+      # The action runs osv-scanner inside its own container, so the binary is
+      # not on the job's PATH — the pinned action release IS the tool version.
+      - name: Record run-manifest fragment (OSV-Scanner)
+        if: always()
+        run: |
+          {
+            echo "## osv-scanner"
+            echo "action: google/osv-scanner-action/osv-scanner-action@v2.3.8 (bundles osv-scanner of the same release)"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-osv.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-osv
+          path: manifest-osv.txt
+          if-no-files-found: warn
 
       - name: Upload OSV SARIF to Security tab
         if: always() && env.TARGET_REPO == ''
@@ -163,6 +220,8 @@ jobs:
     name: SCA + secrets - Trivy
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - name: Checkout this repository (self mode)
         if: env.TARGET_REPO == ''
@@ -174,6 +233,9 @@ jobs:
         with:
           repository: ${{ env.TARGET_REPO }}
           ref: ${{ env.TARGET_REF }}
+          # Never write the job token into the UNTRUSTED target's .git/config —
+          # scanner steps operate on that tree.
+          persist-credentials: false
 
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@v0.36.0
@@ -184,6 +246,27 @@ jobs:
           scanners: vuln,secret,misconfig
           format: sarif
           output: trivy.sarif
+
+      # Reproducibility fragment; the summary job assembles run-manifest.txt.
+      # `trivy --version` also prints the vulnerability-DB UpdatedAt when the
+      # scan step above has populated the local DB cache.
+      - name: Record run-manifest fragment (Trivy)
+        if: always()
+        run: |
+          {
+            echo "## trivy"
+            echo "action: aquasecurity/trivy-action@v0.36.0"
+            trivy --version 2>/dev/null || echo "version: n/a (trivy binary not on PATH)"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-trivy.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-trivy
+          path: manifest-trivy.txt
+          if-no-files-found: warn
 
       - name: Upload Trivy SARIF to Security tab
         if: always() && env.TARGET_REPO == ''
@@ -200,9 +283,94 @@ jobs:
           path: trivy.sarif
           if-no-files-found: warn
 
+  # ---------------------------------------------------------------- CodeQL
+  # GitHub-native SAST, free on public repos, with the cross-file dataflow
+  # analysis Semgrep's free tier lacks. Runs in the same runtime-clone mode as
+  # the other scanners: SARIF goes to disk and is published as a run ARTIFACT
+  # ONLY (`upload: never`) — the Security tab needs the code hosted in this
+  # repository, which phase 1 deliberately avoids. JS/TS needs no build, so
+  # there is no autobuild step.
+  codeql:
+    name: SAST - CodeQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout this repository (self mode)
+        if: env.TARGET_REPO == ''
+        uses: actions/checkout@v4
+
+      - name: Checkout target repository
+        if: env.TARGET_REPO != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.TARGET_REF }}
+          # Never write the job token into the UNTRUSTED target's .git/config —
+          # scanner steps operate on that tree.
+          persist-credentials: false
+
+      # The target is checked out at the workspace root, so the default source
+      # root already points at the cloned target tree.
+      - name: Initialize CodeQL
+        id: codeql-init
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+
+      - name: CodeQL analyze (artifact-only, no Security-tab upload)
+        continue-on-error: true          # a scanner failure must not sink the run; the summary job asserts the SARIF exists
+        uses: github/codeql-action/analyze@v3
+        with:
+          upload: never
+          output: codeql-results
+
+      # analyze names the SARIF after the language; normalise the name so the
+      # summary job's assertions can rely on codeql.sarif.
+      - name: Collect CodeQL SARIF
+        if: always()
+        run: cp codeql-results/*.sarif codeql.sarif 2>/dev/null || echo "::warning::CodeQL produced no SARIF - check the analyze step log"
+
+      # Reproducibility fragment; the summary job assembles run-manifest.txt.
+      - name: Record run-manifest fragment (CodeQL)
+        if: always()
+        run: |
+          {
+            echo "## codeql"
+            echo "action: github/codeql-action@v3"
+            echo "bundle: $("${{ steps.codeql-init.outputs.codeql-path }}" version --format=terse 2>/dev/null || echo 'n/a')"
+            echo "scanned HEAD: $(git rev-parse HEAD 2>/dev/null || echo 'n/a')"
+          } > manifest-codeql.txt
+
+      - name: Upload run-manifest fragment
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-codeql
+          path: manifest-codeql.txt
+          if-no-files-found: warn
+
+      - name: Upload CodeQL SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-codeql
+          path: codeql.sarif
+          if-no-files-found: warn
+
   # ------------------------------------------ optional: Snyk Code (needs token)
   # Uncomment after adding a SNYK_TOKEN repo secret (free account). Kept
   # disabled by default so the workflow runs for anyone with no account setup.
+  #
+  # !! SECURITY - read before re-enabling (phase 2) !!
+  # As written below, SNYK_TOKEN lives in the SAME job that checks out the
+  # UNTRUSTED target tree. Any code execution originating from that tree
+  # (install/build/postinstall scripts, or a scanner escape) could exfiltrate
+  # the secret. Before re-enabling: split the workflow so that NO secret-bearing
+  # step ever shares a job with steps that install, build, or otherwise execute
+  # the target's code — and point it at the licensed phase-2 target (NodeGoat),
+  # never at an unlicensed tree.
   # snyk-code:
   #   name: SAST - Snyk Code
   #   runs-on: ubuntu-latest
@@ -217,6 +385,7 @@ jobs:
   #       with:
   #         repository: ${{ env.TARGET_REPO }}
   #         ref: ${{ env.TARGET_REF }}
+  #         persist-credentials: false
   #     - uses: snyk/actions/setup@master
   #     - name: Snyk Code test
   #       env:
@@ -241,9 +410,12 @@ jobs:
   summary:
     name: Findings summary
     runs-on: ubuntu-latest
-    needs: [ semgrep, osv-scanner, trivy ]
+    needs: [ semgrep, osv-scanner, trivy, codeql ]
     if: always()
     timeout-minutes: 10
+    # Only artifact up/download here, which uses the Actions runtime token —
+    # the GITHUB_TOKEN needs no scopes at all.
+    permissions: {}
     steps:
       - name: Download all SARIF artifacts
         uses: actions/download-artifact@v4
@@ -269,7 +441,66 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Every scan step is `continue-on-error`, so a scanner can die while its
+      # step still reports success — and a missing SARIF simply produces no row
+      # in the table above, masquerading as a clean scan. Mirror the DAST
+      # workflow's report check: each expected SARIF must exist, be non-empty,
+      # and carry at least one rule (a scanner that loaded zero rules is
+      # another silent failure). Any miss fails this job.
+      - name: Verify each expected SARIF was produced
+        run: |
+          fail=0
+          check() {   # $1 = expected SARIF file
+            f="sarif/$1"
+            if [ ! -s "$f" ]; then
+              echo "::error::$1 is missing or empty - its scanner failed silently; check that job's log"
+              fail=1
+              return
+            fi
+            rules=$(jq '.runs[0].tool.driver.rules | length' "$f" 2>/dev/null || echo 0)
+            if [ "${rules:-0}" -eq 0 ]; then
+              echo "::error::$1 has no rules in .runs[0].tool.driver.rules - the scanner loaded zero rules; check that job's log"
+              fail=1
+            fi
+          }
+          check semgrep.sarif
+          check osv.sarif
+          check trivy.sarif
+          check codeql.sarif
+          exit "$fail"
+
+      # ----------------------------------------------- run manifest assembly
+      - name: Download run-manifest fragments
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: manifest-*
+          path: manifest
+          merge-multiple: true
+
+      - name: Assemble run manifest
+        if: always()
+        run: |
+          {
+            echo "# Static audit run manifest"
+            echo "workflow run: ${GITHUB_RUN_ID} (attempt ${GITHUB_RUN_ATTEMPT:-1})"
+            echo "date (UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "target input: ${TARGET_REPO:-${GITHUB_REPOSITORY} (self)}@${TARGET_REF:-default branch}"
+            echo ""
+            cat manifest/*.txt 2>/dev/null || echo "no per-job fragments recovered"
+          } > run-manifest.txt
+          cat run-manifest.txt
+
+      - name: Upload run manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-manifest
+          path: run-manifest.txt
+          if-no-files-found: warn
+
       - name: Re-upload combined SARIF bundle
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sarif-all
